@@ -113,6 +113,29 @@ class TestReadCsv:
         with pytest.raises(ValueError, match="invalid CSV at line 2"):
             read_csv(b'id\n"1"x\n')
 
+    def test_utf16_without_a_byte_order_mark_is_refused(self) -> None:
+        """UTF-16 read as UTF-8 holds NULs, and is refused for them."""
+        with pytest.raises(ValueError, match="NUL characters"):
+            read_csv("id,name\n1,Ann\n".encode("utf-16-le"))
+
+    @pytest.mark.parametrize("separator", [";", "\t"])
+    def test_other_separators_are_refused(self, separator: str) -> None:
+        """A semicolon or tab file isn't read as one wide column.
+
+        Args:
+            separator: The character the file's fields are split by.
+        """
+        data = f"id{separator}name\n1{separator}Ann\n".encode()
+
+        with pytest.raises(ValueError, match="save the file comma-sep"):
+            read_csv(data)
+
+    def test_a_separator_in_one_of_several_headings_is_kept(self) -> None:
+        """A semicolon is fine in a heading of a comma-separated file."""
+        names, _ = read_csv(b"id,Notes; comments\n1,x\n")
+
+        assert names == ["id", "Notes; comments"]
+
 
 class TestReadJson:
     """read_json() reads an array of objects."""
@@ -147,7 +170,7 @@ class TestReadJson:
         [
             ('{"a": 1}', "expected an array of objects, got an object"),
             ("[1]", "item 1 is integer, expected an object"),
-            ('[{"a": 1, "a": 2}]', "repeats the key 'a'"),
+            ('[{"a": 1, "a": 2}]', "repeats a key"),
             ('[{"a": NaN}]', "NaN is not a JSON number"),
             ('[{"a": 1e400}]', "too large for a float"),
             ("[{", "Expecting property name"),
@@ -235,14 +258,15 @@ class TestContractSettings:
         _contract("csv", header_row=3)
 
     def test_workbook_fingerprint_is_unchanged(self) -> None:
-        """An xlsx contract's fingerprint leaves file_format out.
+        """An xlsx contract's fingerprint leaves settings at default out.
 
-        So audit records written before file_format existed still
-        match the same contract.
+        So adding a setting doesn't change the fingerprint in the audit
+        records of contracts that don't use it.
         """
         contract = _contract("xlsx", Column("id", "integer"))
         settings = asdict(contract)
-        del settings["file_format"]
+        for name in ("file_format", "max_columns", "max_cells"):
+            del settings[name]
         before = sha256(
             json.dumps(
                 settings, sort_keys=True, separators=(",", ":")
@@ -333,7 +357,7 @@ class TestCsvContract:
         sheets = contract.read(b"id,extra\nx,1\n", "items.csv", warnings)
 
         assert sheets["items"].rows == [(2, ("x",))]
-        assert "Unexpected columns: extra" in warnings[0]
+        assert "Unexpected columns: 1" in warnings[0]
         assert "doesn't read as a whole number" in warnings[1]
 
     def test_empty_file_is_refused(self) -> None:
@@ -450,6 +474,71 @@ class TestJsonContract:
 
         sheets = _contract("json", allow_empty=True).read(b"[]", "items.json")
         assert sheets["items"].rows == []
+
+    @pytest.mark.parametrize(
+        ("file_format", "data"), [("json", b"[]"), ("jsonl", b"")]
+    )
+    def test_allow_empty_loads_listed_columns_with_no_records(
+        self, file_format: str, data: bytes
+    ) -> None:
+        """With no records, no listed column is reported missing.
+
+        Args:
+            file_format: "json" or "jsonl".
+            data: A file with no records.
+        """
+        contract = _contract(
+            file_format, Column("id", "integer"), allow_empty=True
+        )
+
+        sheets = contract.read(data, f"items.{file_format}")
+
+        assert sheets["items"].columns == ["id"]
+        assert sheets["items"].rows == []
+
+    def test_nullable_key_no_record_uses_reads_as_none(self) -> None:
+        """A nullable key no record holds loads as None, with a warning."""
+        contract = _contract(
+            "jsonl",
+            Column("id", "integer"),
+            Column("note", "string", nullable=True),
+        )
+
+        warnings: list[str] = []
+
+        sheets = contract.read(
+            _jsonl({"id": 1}, {"id": 2}), "items.jsonl", warnings
+        )
+
+        assert sheets["items"].rows == [(1, (1, None)), (2, (2, None))]
+        assert warnings == [
+            "items.jsonl [items]: column 'note' is in no record, so it "
+            "loads as empty in every row; check the export still includes it"
+        ]
+
+    def test_nullable_key_some_records_use_is_not_warned_of(self) -> None:
+        """A key only some records hold is an ordinary blank."""
+        contract = _contract(
+            "jsonl",
+            Column("id", "integer"),
+            Column("note", "string", nullable=True),
+        )
+        warnings: list[str] = []
+
+        contract.read(
+            _jsonl({"id": 1}, {"id": 2, "note": "x"}), "items.jsonl", warnings
+        )
+
+        assert warnings == []
+
+    def test_required_key_no_record_uses_is_refused(self) -> None:
+        """A required key absent from every record fails each row."""
+        contract = _contract(
+            "jsonl", Column("id", "integer"), Column("name", "string")
+        )
+
+        with pytest.raises(ValidationError, match="Row 1: 'name' is required"):
+            contract.read(_jsonl({"id": 1}), "items.jsonl")
 
     def test_wrong_file_name_is_refused_first(self) -> None:
         """file_name is checked before the file is read."""

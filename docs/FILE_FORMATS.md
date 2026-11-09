@@ -83,10 +83,18 @@ pipeline = Pipeline(
 
 - UTF-8, with or without a byte order mark (Excel's "CSV UTF-8"
   writes one). Any other encoding is quarantined, naming the first bad
-  byte's position: export the file again as UTF-8.
+  byte's position: export the file again as UTF-8. Text holding a
+  NUL character, as a UTF-16 file without a byte order mark does, is
+  quarantined too.
 - Comma-separated, with double quotes around a field that holds a
   comma, a quote or a line break. Anything else, such as text after a
-  closing quote, is quarantined.
+  closing quote, is quarantined. So is a row with more fields than the
+  heading row, which usually means an unquoted comma has moved every
+  value after it into the next column, and a heading row that is one
+  heading holding a semicolon or a tab, which a file separated by
+  those has.
+- A field holding an Excel error, such as `#REF!`, is quarantined or
+  warned about, as in a worksheet.
 - Headings are named as in a worksheet: used exactly as written, a
   blank heading over data becomes `col_B`, a repeat gets `_2`.
   `header_row` skips lines above the headings.
@@ -115,7 +123,11 @@ pipeline = Pipeline(
   has one object per line, and blank lines are skipped.
 - The columns are every key the objects use, exactly as written, in
   the order they first appear. A key an object leaves out is `null`
-  in that row.
+  in that row, so a listed column that no object uses is never
+  "missing": each row fails if the column is required, and loads
+  `null` if it is nullable. A nullable listed column that no object
+  in the file uses also gives a warning, whatever `on_mismatch` is,
+  as the export may have dropped it.
 - Values keep their JSON types: text, numbers, `true` and `false`,
   `null`, and nested objects and arrays, which load into the payload
   unchanged.
@@ -178,3 +190,51 @@ The payload holds the file's values as described above:
   `JSON_VALUE_ARRAY(payload['Tags'])`.
 
 See [`DATAFORM.md`](DATAFORM.md) for the layers and checks.
+
+## Graph list exports
+
+`GraphJsonLinesContract` reads one list-item envelope per line and maps
+SharePoint internal field names and selected envelope metadata to the
+contract's columns. Configure `field_map`, `metadata_map` and
+`excluded_fields`; no list schema is guessed. An `any` column preserves
+lookup identifiers, arrays and nested values without turning them into
+text. Keep Graph's column definitions as `schema.json` beside each
+export. The original JSON Lines bytes remain the archived source.
+
+A list item's `fields` hold more than the list's columns: SharePoint
+adds system fields such as `LinkTitle`, `AuthorLookupId` and
+`_UIVersionString`, and a multi-choice column gains a
+`<name>@odata.type` entry. Each counts as a field, so `excluded_fields`
+lists them. `dummy_was_database.jsonl` in this folder is a complete
+example: `dummy_was_database.xlsx` written as Graph would send it, with
+`tests/unit/test_graph_export.py` holding its mapping. Its internal
+names follow SharePoint's naming rule, and are not from a real list.
+
+SharePoint leaves a blank field out of an item, so a nullable mapped
+field that only some items hold loads as `null` in the others. One
+that no item holds, such as a column deleted from the list, still
+loads, as `null` in every row, with a warning naming its column. The
+dummy export gives one for `Date of session 2`, which is empty in
+every row of the dummy workbook.
+
+`site_time_zone` is the time zone in the SharePoint site's regional
+settings. Graph sends dates in UTC, and SharePoint stores a date-only
+value as local midnight, so a date column is converted back to this
+zone: `2026-05-31T23:00:00Z` loads as `2026-06-01T00:00:00` in
+`Europe/London`. A contract with a date column needs this setting.
+Check it against a real export: compare a summer date in the list with
+the same item in the file.
+
+`multi_value_separators` joins a multi-choice list into one text value,
+for a text column that a workbook export holds as separated text:
+`{"Topics": ";#"}` loads `["A", "B"]` as `A;#B`. A choice that isn't
+text, or that contains the separator, quarantines the file.
+
+## Limits in every format
+
+All source formats reject non-finite numeric values and unpaired Unicode
+surrogates. JSON containers are limited to 128 nested levels to bound
+conversion recursion. JSON integers must fit BigQuery JSON's signed INT64
+through unsigned UINT64 range. Payload object keys are canonicalised;
+source row numbers and source-byte checksums remain provenance, so row or
+byte permutations do not imply identical complete processed files.

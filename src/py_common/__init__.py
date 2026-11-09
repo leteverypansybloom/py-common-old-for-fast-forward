@@ -13,13 +13,13 @@ All cloud services are behind Protocol interfaces, so tests run locally.
 The names in __all__ are the supported API, versioned by semver (see
 CHANGELOG.md). Adapters are imported from py_common.adapters.*, the
 runner helpers from py_common.runner and logging set-up from
-py_common.logging. Anything else (e.g. AuditRecord, SecretStore,
-names starting with "_") may change in any release.
+py_common.logging. Anything else (e.g. AuditRecord, names starting
+with "_") may change in any release.
 """
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
-from py_common.contract import Column, Contract, Worksheet
+from py_common.contract import Column, Contract, SheetRows, Worksheet
 from py_common.errors import (
     ConfigError,
     ContractError,
@@ -33,15 +33,21 @@ from py_common.errors import (
     ValidationError,
     VersionMismatch,
 )
-from py_common.model import Outcome, Result, SourceItem
+from py_common.graph import GraphJsonLinesContract
+from py_common.model import Outcome, Result, SourceItem, digest
 from py_common.pipeline import Pipeline
 from py_common.ports import ObjectStore, Source, Warehouse
+from py_common.raw import ROW_FIELDS
 
 __all__ = [
     "Pipeline",
     "Contract",
     "Worksheet",
     "Column",
+    "SheetRows",
+    "GraphJsonLinesContract",
+    "ROW_FIELDS",
+    "digest",
     "Outcome",
     "Result",
     "SourceItem",

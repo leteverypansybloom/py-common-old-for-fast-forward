@@ -6,6 +6,132 @@ All notable changes to py-common. The supported API is what
 [semantic versioning](https://semver.org/): while the major version
 is 0, a minor release (0.x.0) may break that API, and says how below.
 
+## Unreleased
+
+### Added
+
+- `docs/dummy_was_database.jsonl`: the dummy WAS workbook as a Graph list
+  export, and `tests/unit/test_graph_export.py`, which reads it through
+  `GraphJsonLinesContract` and compares every column with the workbook.
+
+### Removed
+
+- `ports.SecretStore`, a protocol with no implementation or caller. It
+  was outside the supported API.
+- `scripts/gcp_auth.py` and its tests. The adapters authenticate
+  through Application Default Credentials;
+  `scripts/check_gcp_auth.py` still checks local credentials.
+- `docs/upcoming_work.md` and its images, an archived design.
+  `docs/GCP_SETUP.md` is the maintained set-up.
+
+- `docs/RUNBOOK.md`, "An upload was loaded twice": how to remove the
+  later load, rows and audit row together.
+
+### Changed
+
+- The store's audit records count rows only for a load: a skipped,
+  quarantined or failed attempt records 0 rows. When the warehouse
+  already holds the file version, because a run committed it and lost
+  the confirmation, the receipt records it as loaded, with a warning
+  saying so.
+- The nightly live BigQuery workflow is skipped, not failed, until its
+  four repository variables are set. A manual run still fails, naming
+  them.
+- A file over `max_file_bytes` is quarantined from its listed size,
+  without being downloaded, so no copy of it reaches `raw/` or
+  `quarantine/`. It stays in the landing folder.
+- A "date" column accepts the years 1900 to 2100, in every file format.
+
+### Fixed
+
+- `docs/INGESTION_FRAMEWORK_GUIDE.md` now says the nightly workflow
+  runs the live BigQuery tests.
+- An Excel error value (`#REF!`, `#N/A`, ...) in a loaded column of a
+  workbook or CSV file follows `on_mismatch` instead of loading as text.
+- A workbook with rows out of order or repeated is quarantined. The
+  reader dropped those rows without a word.
+- A CSV row with more fields than the heading row is quarantined, so an
+  unquoted comma can't move an excluded column's value into a loaded one.
+- `Contract.max_columns` and `Contract.max_cells` limit the table a file
+  unpacks to, as it is read. A small file could otherwise take gigabytes
+  of memory, with one far-right cell per row or a new key per JSON line.
+- A workbook that can't be read because of its zip or package structure,
+  or a contract sheet that is a chart sheet, is quarantined instead of
+  failing on every run.
+- `GraphJsonLinesContract` quarantines a date too extreme to convert,
+  such as `0001-01-01T00:00:00Z`, instead of failing on every run.
+- `RawJsonWarehouse` quarantines a file whose rows BigQuery refuses (a
+  400 with the reason `invalid`) instead of retrying it on every run.
+- A JSON or JSON Lines file with listed columns and no records loads
+  when `allow_empty` is set, and a nullable key that no record uses
+  reads as None. Both were reported as a missing column.
+- A CSV file holding NUL characters, as UTF-16 does, or whose heading
+  row is one heading holding a semicolon or a tab, is quarantined. Under
+  `all_except` it loaded as one column of garbled text.
+- `LocalObjectStore.put()` writes beside the file and renames it into
+  place, so a write cut off part-way no longer blocks every retry.
+- `LocalSource.download()` checks the file's version again after
+  reading it, so a file replaced during the read isn't stored under the
+  version it replaced.
+- The duplicate-load guidance in `docs/GCP_SETUP.md` and
+  `runner.check_duplicate_loads()` deletes the later load's audit row
+  as well as its rows, and no longer says Dataform is unaffected.
+- `test_malformed_quarantines` has short test names, so it runs on
+  Windows.
+- `LocalObjectStore.put()` writes its temporary file under
+  `.partial/` in the store folder, with a short name. Beside the file,
+  the temporary name took a key whose path was 220 to 239 characters
+  past the Windows path limit, and the write failed on every run.
+- A nullable listed column that no record of a JSON or JSON Lines file
+  holds, or a mapped SharePoint field that no item holds, gives a
+  contract warning naming the column. It loaded as `null` in every row
+  without a word, as a column deleted from the export would.
+
+## 0.5.0 - 2026-11-04
+
+SharePoint list exports from Microsoft Graph load through an explicit
+field mapping, and logs and errors no longer repeat file contents.
+
+### Added
+
+- **`GraphJsonLinesContract`**: reads one Graph list item per line and
+  maps internal field names and envelope properties to the contract's
+  columns. Any field that is neither mapped nor excluded stops the
+  file. `site_time_zone` converts date columns from UTC to the site's
+  local time, and `multi_value_separators` joins a multi-choice list
+  into one text value.
+- `Column` type `"any"`, for mixed or nested values.
+- `SheetRows`, `ROW_FIELDS` and `digest` in `py_common.__all__`, and a
+  `py.typed` marker, so other projects' type checkers follow py-common.
+- `tzdata`, for time zones on Windows and slim images.
+
+### Changed
+
+- **Payload object keys are written in alphabetical order**, at every
+  level. A processed copy of the same file has different bytes from
+  0.4.0, though the same values.
+- Values a raw JSON payload can't hold are refused in every format:
+  unpaired surrogates, numbers that aren't finite, integers outside
+  BigQuery JSON's range, and more than 128 nested levels.
+- `RawJsonWarehouse` creates every configured table on each load, so a
+  worksheet with no rows has an empty table, and refuses identifiers
+  with characters BigQuery doesn't allow.
+- `GCSSource` and `LocalSource` log a warning for each file they skip
+  for its extension. A `schema.json` beside an export is not reported.
+- The loaded marker holds the attempt's audit record, so a retry after
+  an audit failure can still write it.
+- Over 240 characters on Windows, `LocalObjectStore` keeps an object
+  under `.objects/`, named by a hash of its key.
+
+### Fixed
+
+- Unexpected-column, parser, configuration and BigQuery errors no
+  longer repeat cell values, headings or remote messages. A lost
+  heading row could put names and email addresses in the logs and audit
+  records.
+- A CSV integer too long for Python to convert is reported as out of
+  range, not as a crash.
+
 ## 0.4.0 - 2026-11-03
 
 CSV, JSON and JSON Lines files load the same way as workbooks.

@@ -9,6 +9,7 @@ docs/GETTING_STARTED.md shows a small in-memory fake.
 
 import logging
 import os
+import uuid
 from collections.abc import Generator, Iterable
 from contextlib import contextmanager
 from pathlib import Path
@@ -19,7 +20,7 @@ from py_common.errors import (
     ServiceError,
     VersionMismatch,
 )
-from py_common.model import SourceItem
+from py_common.model import SourceItem, digest
 
 logger = logging.getLogger("py_common.adapters.local")
 
@@ -85,9 +86,14 @@ class LocalSource:
             return
 
         for path in sorted(self.folder.iterdir()):
-            if not (
-                path.is_file() and path.name.lower().endswith(self.extensions)
-            ):
+            if not path.is_file():
+                continue
+            if not path.name.lower().endswith(self.extensions):
+                if path.name != "schema.json":
+                    logger.warning(
+                        "Ignoring file with unsupported extension: %s",
+                        path.name,
+                    )
                 continue
             stat = path.stat()
             yield SourceItem(
@@ -112,7 +118,8 @@ class LocalSource:
             File bytes.
 
         Raises:
-            VersionMismatch: File was modified since discovery.
+            VersionMismatch: File was modified since discovery, or
+                while it was read.
             NotFound: File no longer exists.
         """
         path = self.folder / item.identity
@@ -120,16 +127,35 @@ class LocalSource:
         if not path.exists():
             raise NotFound(f"File not found: {path}")
 
-        current_version = _version(path.stat())
+        self._check_version(path, item)
+        with open(path, "rb") as f:
+            data = f.read()
+        # Checked again after reading: a file replaced while it was read
+        # would otherwise be stored under the version it replaced.
+        self._check_version(path, item)
+        return data
 
+    @staticmethod
+    def _check_version(path: Path, item: SourceItem) -> None:
+        """Refuse a file whose version is no longer the discovered one.
+
+        Args:
+            path: The file.
+            item: SourceItem from discovery.
+
+        Raises:
+            VersionMismatch: The file's version differs from item's.
+            NotFound: The file no longer exists.
+        """
+        try:
+            current_version = _version(path.stat())
+        except FileNotFoundError:
+            raise NotFound(f"File not found: {path}") from None
         if current_version != item.version:
             raise VersionMismatch(
                 f"File modified since discovery: {path} "
                 f"(was {item.version}, now {current_version})"
             )
-
-        with open(path, "rb") as f:
-            return f.read()
 
 
 class LocalObjectStore:
@@ -166,7 +192,10 @@ class LocalObjectStore:
             path.resolve().relative_to(self.folder.resolve())
         except ValueError:
             raise ValueError(f"Key escapes object store root: {key}") from None
-        return path
+        resolved = path.resolve()
+        if os.name == "nt" and len(str(resolved)) >= 240:
+            return self.folder.resolve() / ".objects" / digest(key.encode())
+        return resolved
 
     def get(self, key: str) -> bytes | None:
         """Read file by key path.
@@ -219,7 +248,20 @@ class LocalObjectStore:
                 f"Key {key} exists with different content"
             )
 
-        path.write_bytes(data)
+        # Written to a short name in the store's own folder and then
+        # moved into place, so a write cut off part-way, as on a full
+        # disk, leaves no partial file for every later put to conflict
+        # with. A name beside the file would be longer than the file's
+        # own, and could pass the Windows path limit that the file's
+        # path stays under (_resolve_path).
+        partials = self.folder.resolve() / ".partial"
+        partials.mkdir(exist_ok=True)
+        partial = partials / uuid.uuid4().hex
+        try:
+            partial.write_bytes(data)
+            os.replace(partial, path)
+        finally:
+            partial.unlink(missing_ok=True)
         logger.debug("Wrote object: %s (%d bytes)", key, len(data))
 
     @contextmanager

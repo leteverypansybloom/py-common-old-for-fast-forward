@@ -5,9 +5,11 @@ stateful fake client (_fake_bigquery.py), so the warehouse's own
 audit check is what decides, not a Mock's return value.
 """
 
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from io import BytesIO
+from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
@@ -127,7 +129,12 @@ class Harness:
         self.pipeline = Pipeline(self.source, self.store, warehouse, CONTRACT)
 
     def upload(self, data: bytes, version: str) -> Outcome:
-        """Make `data` the file's content at `version`; run once."""
+        """Make `data` the file's content at `version`; run once.
+
+        Args:
+            data: Synthetic source bytes.
+            version: Synthetic source version.
+        """
         item = SourceItem("events.xlsx", "landing/events.xlsx", version, 1)
         self.source.items.return_value = [item]
         self.source.download.return_value = data
@@ -142,6 +149,19 @@ class Harness:
             The count.
         """
         return self.client.rows.get(self.table, 0)
+
+    @property
+    def records(self) -> list[dict[str, Any]]:
+        """Read the attempt records the pipeline stored.
+
+        Returns:
+            Each record under audit/records/, parsed.
+        """
+        return [
+            json.loads(data)
+            for key, data in self.store.objects.items()
+            if key.startswith("audit/records/")
+        ]
 
 
 @pytest.fixture
@@ -164,7 +184,11 @@ class TestCrashAfterCommit:
     def test_marker_write_fails_then_retry_is_a_no_op(
         self, harness: Harness
     ) -> None:
-        """Commit succeeds, the marker put fails: FAILED, then SKIPPED."""
+        """Commit succeeds, the marker put fails: FAILED, then SKIPPED.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.store.fail_on = "audit/p.d."
 
         first = harness.upload(A, "1")
@@ -180,7 +204,11 @@ class TestCrashAfterCommit:
     def test_lost_commit_wait_then_retry_is_a_no_op(
         self, harness: Harness
     ) -> None:
-        """Connection drops after COMMIT: indeterminate, then no-op."""
+        """Connection drops after COMMIT: indeterminate, then no-op.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.client.lose_next_commit_wait = ConnectionError("reset")
 
         first = harness.upload(A, "1")
@@ -191,10 +219,51 @@ class TestCrashAfterCommit:
         assert harness.rows == 2
         assert len(harness.client.audit) == 1
 
+    def test_lost_commit_wait_leaves_a_loaded_record(
+        self, harness: Harness
+    ) -> None:
+        """The store's records show the load the warehouse already held.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
+        harness.client.lose_next_commit_wait = ConnectionError("reset")
+
+        harness.upload(A, "1")
+        harness.upload(A, "1")
+
+        loaded = [r for r in harness.records if r["outcome"] == "loaded"]
+        assert [r["rows_processed"] for r in loaded] == [2]
+        assert "already held" in loaded[0]["warnings"][0]
+
+    def test_only_a_load_records_rows(self, harness: Harness) -> None:
+        """A failed or skipped attempt records no rows processed.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
+        harness.client.lose_next_commit_wait = ConnectionError("reset")
+
+        harness.upload(A, "1")
+        harness.upload(A, "1")
+        harness.upload(A, "1")
+
+        others = [r for r in harness.records if r["outcome"] != "loaded"]
+        assert sorted(r["outcome"] for r in others) == [
+            "failed",
+            "skipped",
+            "skipped",
+        ]
+        assert [r["rows_processed"] for r in others] == [0, 0, 0]
+
     def test_lost_store_markers_are_rebuilt_from_warehouse(
         self, harness: Harness
     ) -> None:
-        """Even with the whole store cache gone, BigQuery decides."""
+        """Even with the whole store cache gone, BigQuery decides.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.upload(A, "1")
         harness.store.objects = {
             k: v
@@ -213,7 +282,11 @@ class TestAuditRecordFailure:
     def test_audit_write_failure_marks_file_failed_and_run_continues(
         self, harness: Harness
     ) -> None:
-        """The run returns a result per file instead of aborting."""
+        """The run returns a result per file instead of aborting.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         second = SourceItem("other.xlsx", "landing/other.xlsx", "1", 1)
         first = SourceItem("events.xlsx", "landing/events.xlsx", "1", 1)
         harness.source.items.return_value = [first, second]
@@ -231,7 +304,11 @@ class TestAuditRecordFailure:
     def test_marker_is_written_before_audit_record(
         self, harness: Harness
     ) -> None:
-        """The marker (the cache) lands even if the audit put fails."""
+        """The marker (the cache) lands even if the audit put fails.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.store.fail_on = "audit/records/"
 
         harness.upload(A, "1")
@@ -245,7 +322,11 @@ class TestDedupKey:
     def test_raw_revert_to_earlier_content_is_loaded(
         self, harness: Harness
     ) -> None:
-        """gen1 = A, gen2 = B, gen3 = A: gen3 is the latest, so it loads."""
+        """gen1 = A, gen2 = B, gen3 = A: gen3 is the latest, so it loads.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         outcomes = [
             harness.upload(A, "1"),
             harness.upload(B, "2"),
@@ -263,7 +344,11 @@ class TestDedupKey:
     def test_raw_same_generation_twice_is_skipped(
         self, harness: Harness
     ) -> None:
-        """The same identity + version is one load, whatever happens."""
+        """The same identity + version is one load, whatever happens.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.upload(A, "1")
 
         assert harness.upload(A, "1") == Outcome.SKIPPED
@@ -272,7 +357,11 @@ class TestDedupKey:
     def test_audit_row_names_destination_and_version(
         self, harness: Harness
     ) -> None:
-        """The audit row says where the file went and which version."""
+        """The audit row says where the file went and which version.
+
+        Args:
+            harness: Pipeline and fake-service harness.
+        """
         harness.upload(A, "7")
 
         [row] = harness.client.audit

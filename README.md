@@ -38,6 +38,33 @@ A contract reads one kind of file (`Contract.file_format`): an
 Excel workbook (the default), a CSV file, a JSON array of objects or
 a JSON Lines file. See [`docs/FILE_FORMATS.md`](docs/FILE_FORMATS.md).
 
+A SharePoint list exported from Microsoft Graph, one item per line, uses
+`GraphJsonLinesContract`, which says where each column comes from:
+
+```python
+contract = GraphJsonLinesContract(
+    worksheets=[
+        Worksheet(
+            "requests",
+            [
+                Column("Organisation", "string"),
+                Column("Requested", "date", nullable=True),
+                Column("Topics", "string", nullable=True),
+            ],
+        )
+    ],
+    file_format="jsonl",
+    field_map={
+        "Organisation": "Title",
+        "Requested": "RequestDate",
+        "Topics": "TopicChoices",
+    },
+    excluded_fields=["ContactEmail"],
+    site_time_zone="Europe/London",
+    multi_value_separators={"Topics": ";#"},
+)
+```
+
 Every configured worksheet is inserted into its own raw table
 (`RawJsonWarehouse`), one JSON payload per row, with the file,
 generation, sheet and row number it came from. Rows are only ever
@@ -75,7 +102,12 @@ described in
 - Names every column: blank headings become `col_B`, repeated ones
   `Other_2`
 - Refuses oversized files before parsing them (`max_file_bytes`,
-  `max_uncompressed_bytes`, which also stops "zip bombs")
+  checked from the listed size before a download, and
+  `max_uncompressed_bytes`, which also stops "zip bombs"), and tables
+  too large to hold as they are read (`max_columns`, `max_cells`)
+- Refuses Excel error values such as `#REF!` in a loaded column, rows
+  that a workbook stores out of order, and dates outside the years
+  1900 to 2100
 - Can require the agreed file name (`file_name`): an upload under any
   other name is quarantined, so it can't become a second "latest"
   upload of the same data
@@ -232,7 +264,7 @@ See [`CONTRIBUTING.md`, Checks](CONTRIBUTING.md#checks).
 | `GCSObjectStore` | ObjectStore | Built, unit-tested against mocks; real `lock()` |
 | `RawJsonWarehouse` | Warehouse | Built, unit-tested against mocks; one raw JSON table per sheet, not yet run live |
 | `SharePointSource` | Source | Built, unit-tested against mocked Graph; not yet run live (auth pending IT) |
-| Secret Manager | SecretStore | Not started |
+| `GraphJsonLinesContract` | Contract | Built, unit-tested on synthetic exports; not yet run on a real list export |
 
 Also built: contract validation for workbooks, CSV, JSON and JSON
 Lines files, the raw JSON conversion (`raw.py`),
@@ -284,12 +316,8 @@ library or the test suite:
   real cloud resources.
 - `scripts/check_gcp_auth.py`: checks your local GCP credentials can
   reach BigQuery and Cloud Storage.
-- `scripts/gcp_auth.py`: a Python port of the R `gcp_auth.R` helper.
-  Not part of the library: the adapters authenticate through Google's
-  client libraries (Application Default Credentials). Kept for code
-  ported from R; likely to be removed.
 
-The first two read their project settings from environment variables; see the
+Both read their project settings from environment variables; see the
 header of each file.
 
 ## Standards
@@ -297,7 +325,8 @@ header of each file.
 PEP 8 with 79-character lines (Black and Ruff), type hints checked
 by mypy in strict mode, Google-style docstrings, and tests written
 before the code. The project follows the Reproducible Analytical
-Pipelines (RAP) approach: reproducible, auditable and peer-reviewed.
+Pipelines (RAP) approach: reproducible and auditable. Independent
+review is required before production use.
 Details are in [`CONTRIBUTING.md`](CONTRIBUTING.md#code-standards).
 
 ## License

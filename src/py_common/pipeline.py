@@ -35,6 +35,11 @@ from py_common.raw import to_ndjson
 
 logger = logging.getLogger("py_common.pipeline")
 
+_ALREADY_HELD = (
+    "The warehouse already held this file version: a run committed it "
+    "but lost the confirmation, so it was not loaded again"
+)
+
 
 def _fields(**more: Any) -> dict[str, Any]:
     """`extra=` for a pipeline log call: the run and file fields.
@@ -256,6 +261,27 @@ class Pipeline:
                     item, Outcome.SKIPPED, checksum, 0, errors, start_time
                 )
 
+            # Before the download, which reads the whole file into
+            # memory. There are no bytes to keep in quarantine/.
+            if isinstance(self.contract, Contract):
+                try:
+                    self.contract.check_file_size(item.size_bytes, item.name)
+                except ValidationError as e:
+                    logger.warning(
+                        "Validation failed for %s: %s",
+                        item.name,
+                        e,
+                        extra=_fields(),
+                    )
+                    return self._make_result(
+                        item,
+                        Outcome.QUARANTINED,
+                        checksum,
+                        0,
+                        [str(e)],
+                        start_time,
+                    )
+
             data = self._download(item)
             if data is None:
                 return self._make_result(
@@ -311,12 +337,36 @@ class Pipeline:
                     checksum[:8],
                     extra=_fields(),
                 )
-            if outcome in (Outcome.LOADED, Outcome.SKIPPED):
-                # The warehouse has the file either way: record that
-                # in the marker cache before anything else can fail.
-                self.store.put(self._loaded_marker_key(item), b"processed")
             if outcome == Outcome.SKIPPED:
-                rows_processed = 0
+                # Only reached when the warehouse already holds this
+                # version: an earlier run committed it but lost the
+                # confirmation, so no record of that run says "loaded".
+                warnings.append(_ALREADY_HELD)
+            if outcome in (Outcome.LOADED, Outcome.SKIPPED):
+                # The receipt records the load itself, which the
+                # warehouse holds either way, so it says "loaded".
+                receipt_result = self._make_result(
+                    item,
+                    Outcome.LOADED,
+                    checksum,
+                    rows_processed,
+                    errors,
+                    start_time,
+                    warehouse_key,
+                    warnings,
+                    processed_key,
+                )
+                audit_key, audit_data = self._audit_payload(receipt_result)
+                receipt = json.dumps(
+                    {
+                        "audit_key": audit_key,
+                        "audit_data": audit_data.decode(),
+                    },
+                    sort_keys=True,
+                ).encode()
+                marker_key = self._loaded_marker_key(item)
+                if not self.store.get(marker_key):
+                    self.store.put(marker_key, receipt)
 
         except Exception as e:
             if outcome != Outcome.QUARANTINED:
@@ -326,6 +376,11 @@ class Pipeline:
             logger.exception(
                 "Processing error for %s: %s", item.name, e, extra=_fields()
             )
+
+        # Only a load counts rows: a skip, a quarantine or a failure
+        # loaded nothing in this attempt.
+        if outcome != Outcome.LOADED:
+            rows_processed = 0
 
         return self._make_result(
             item,
@@ -649,6 +704,26 @@ class Pipeline:
         Args:
             result: Processing result to record.
         """
+        marker = self.store.get(self._loaded_marker_key(result.item))
+        if isinstance(marker, bytes) and marker.startswith(b"{"):
+            receipt = json.loads(marker)
+            self.store.put(
+                receipt["audit_key"], receipt["audit_data"].encode()
+            )
+            if result.outcome == Outcome.LOADED:
+                return
+        key, data = self._audit_payload(result)
+        self.store.put(key, data)
+
+    def _audit_payload(self, result: Result) -> tuple[str, bytes]:
+        """Prepare a recoverable audit record for one attempt.
+
+        Args:
+            result: Processing result to record.
+
+        Returns:
+            The object key and serialised audit record.
+        """
         record = AuditRecord(
             timestamp=datetime.now(UTC),
             item_identity=result.item.identity,
@@ -688,4 +763,4 @@ class Pipeline:
             f"audit/records/{timestamp_key}_{uuid.uuid4().hex[:8]}_"
             f"{result.item.identity}.json"
         )
-        self.store.put(audit_key, audit_json.encode())
+        return audit_key, audit_json.encode()
