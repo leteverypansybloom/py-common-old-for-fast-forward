@@ -1,0 +1,126 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "py-common"
+version = "0.2.0"
+description = "Shared ingestion library for Excel to cloud workflows"
+readme = "README.md"
+license = {text = "MIT"}
+authors = [{name = "Public Health Wales", email = "eoinvondy@gmail.com"}]
+requires-python = ">=3.11"
+# Upper bounds stop a fresh install pulling in a major version the
+# code was never tested against. Lower bounds exclude releases with
+# known advisories (pip-audit). defusedxml: openpyxl only guards
+# against XML entity attacks in uploaded workbooks when it is
+# installed.
+dependencies = [
+    "openpyxl>=3.1,<4",
+    "pyyaml>=6.0,<7",
+    "pyarrow>=23.0.1,<27",
+    "defusedxml>=0.7.1,<1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-cov>=4.1.0",
+    # Exact pins, kept equal to the hook revs in
+    # .pre-commit-config.yaml, so local runs, hooks and CI all use the
+    # same versions. Bump both files together.
+    "black==26.10.1",
+    "ruff==0.17.0",
+    "mypy==2.4.0",
+    "pre-commit>=3.7.0",
+    "detect-secrets>=1.5.0",
+    # mypy --strict needs type stubs for untyped runtime deps, or it
+    # stops at the import line before checking any real code.
+    "types-PyYAML>=6.0",
+    # Tests read Parquet back with pandas; the library itself writes
+    # it with pyarrow and a contract-typed schema.
+    "pandas>=2.0,<3",
+    "pandas-stubs>=2.0,<3",
+    "types-openpyxl>=3.0.0",
+    "types-requests>=2.31.0",
+    # SharePoint adapter unit tests import requests (for its
+    # exception types) even though they never touch the network.
+    "requests>=2.33.0,<3",
+]
+gcp = [
+    "google-cloud-storage>=2.10,<4",
+    "google-cloud-bigquery>=3.13,<4",
+    "google-api-core>=2.11,<3",
+]
+# Authentication is injected (see adapters/sharepoint.py), so no
+# identity library is pinned here until IT approves a credential flow.
+sharepoint = [
+    "requests>=2.33.0,<3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 79
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 79
+target-version = "py311"
+
+[tool.ruff.lint]
+# The same rules as the projects that use py-common.
+select = [
+    "E", "W",   # pycodestyle (PEP 8)
+    "F",        # pyflakes: unused names, undefined names
+    "I",        # import order
+    "N",        # PEP 8 naming
+    "D",        # docstrings
+    "UP",       # modern syntax for the target Python version
+    "B",        # likely bugs (mutable defaults, closures in loops, ...)
+]
+# The exception names (NotFound, RunFailed, ...) are public API that
+# callers catch by name, so they keep their names without "Error".
+ignore = ["N818"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
+
+[tool.ruff.lint.isort]
+known-first-party = ["py_common"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+# numpy's own bundled type stubs use syntax that requires Python
+# 3.12+ (e.g. `type X = ...`), which mypy refuses to parse while
+# targeting 3.11. Nothing here imports numpy directly - it only
+# arrives transitively via pandas - so numpy's stubs are skipped
+# rather than raising the project's python_version target, which
+# would stop mypy enforcing 3.11 compatibility for our own code.
+follow_imports_for_stubs = true
+
+[[tool.mypy.overrides]]
+module = ["numpy", "numpy.*"]
+follow_imports = "skip"
+ignore_missing_imports = true
+
+# The Google Cloud client libraries (and google-crc32c) ship without
+# type information, so mypy --strict would stop at the import line.
+# "google" itself is listed for environments without them, such as
+# the pre-commit hook's.
+[[tool.mypy.overrides]]
+module = [
+    "google",
+    "google.*",
+    "google_crc32c",
+    "pyarrow",
+    "pyarrow.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+markers = ["integration: marks tests requiring live cloud services"]

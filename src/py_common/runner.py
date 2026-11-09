@@ -1,0 +1,382 @@
+"""Run pipelines from a scheduled job or an upload event.
+
+Pipeline.run() records a file that fails as a FAILED result and
+carries on with the next one, so a run that returns normally can
+still have failed files. These helpers turn that into the signal the
+platform acts on:
+
+- run_job(): for a Cloud Run job. Runs every pipeline, even after one
+  fails, and returns the exit code: 1 if any file FAILED or any run
+  could not finish.
+- handle_upload(): for a Cloud Run service behind an Eventarc trigger.
+  Runs the pipeline for the landing folder that received the upload,
+  and raises if a file FAILED, so Pub/Sub delivers the event again.
+- check_freshness(): logs each source that a freshness view says is
+  overdue, for a log-based alert to pick up.
+- check_duplicate_loads(): logs each upload the audit table shows
+  loaded more than once into a table, for a log-based alert.
+
+QUARANTINED is not a failure here: the file itself is wrong, and
+retrying won't fix it. Pipeline.process() logs the quarantine, which
+has its own alert.
+
+An upload event runs Pipeline.run(), not Pipeline.process(). run()
+takes the warehouse lock and writes the audit record and the "already
+loaded" marker, so an event delivered twice loads the file once.
+process() does neither, and calling it alone would load the file
+again on every delivery.
+
+No cloud SDK is imported here (see DECISIONS_en.md, "No cloud SDK
+imports in core pipeline"): the event arrives as a plain mapping, and
+the checks take any client with a BigQuery-style query().
+"""
+
+import base64
+import json
+import logging
+import re
+from collections import Counter
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from typing import Any, Protocol
+
+from py_common.errors import RunFailed
+from py_common.model import Outcome, Result
+from py_common.pipeline import Pipeline
+
+logger = logging.getLogger("py_common.runner")
+
+#: GCS notification event types that mean "a new object version".
+#: GCS always sets the eventType attribute, so a message without one
+#: is not an upload notification and is ignored.
+_NEW_OBJECT_EVENTS = ("OBJECT_FINALIZE",)
+
+#: A fully qualified view or table name: project.dataset.name.
+_QUALIFIED_NAME = re.compile(r"^[\w-]+\.[\w-]+\.[\w-]+$")
+
+
+class QueryClient(Protocol):
+    """A client that runs SQL; google.cloud.bigquery.Client fits."""
+
+    def query(self, query: str) -> Any:
+        """Start a query.
+
+        Args:
+            query: SQL text.
+
+        Returns:
+            A job whose result() iterates rows by column name.
+        """
+        ...
+
+
+@dataclass(frozen=True)
+class Upload:
+    """One object written to a landing bucket.
+
+    Attributes:
+        bucket: Bucket name, without gs://.
+        name: Object name, e.g. "was/was_database.xlsx".
+        generation: Object generation, as text.
+        event_type: GCS notification event type, e.g.
+            "OBJECT_FINALIZE"; empty if the message didn't say.
+    """
+
+    bucket: str
+    name: str
+    generation: str
+    event_type: str
+
+    @property
+    def folder(self) -> str:
+        """Folder the object sits directly in, as GCSSource names it.
+
+        Returns:
+            "was/" for "was/was_database.xlsx"; "" at the bucket root.
+        """
+        head, sep, _ = self.name.rpartition("/")
+        return f"{head}/" if sep else ""
+
+
+def run_or_raise(pipeline: Pipeline) -> list[Result]:
+    """Run one pipeline and raise if any file FAILED.
+
+    Args:
+        pipeline: Pipeline to run.
+
+    Returns:
+        One Result per file at the source.
+
+    Raises:
+        RunFailed: One or more files FAILED. Every other file was
+            still processed.
+        RuntimeError: Another run holds the warehouse lock.
+        ServiceError: Listing the source or writing audit failed.
+    """
+    results = pipeline.run()
+    counts = Counter(result.outcome for result in results)
+    logger.info(
+        "Run for %s: %d loaded, %d skipped, %d quarantined, %d failed",
+        pipeline.warehouse.identity,
+        counts[Outcome.LOADED],
+        counts[Outcome.SKIPPED],
+        counts[Outcome.QUARANTINED],
+        counts[Outcome.FAILED],
+    )
+    failed = [r for r in results if r.outcome == Outcome.FAILED]
+    if failed:
+        raise RunFailed(failed)
+    return results
+
+
+def run_job(pipelines: Iterable[Pipeline]) -> int:
+    """Run every pipeline once, for a scheduled Cloud Run job.
+
+    A pipeline that fails, or can't start because another run holds
+    its lock, doesn't stop the others: each source is independent.
+
+    Args:
+        pipelines: Pipelines to run, in order.
+
+    Returns:
+        Exit code: 0 if every run finished with no FAILED file,
+        otherwise 1, so the job execution shows as failed.
+    """
+    ok = True
+    for pipeline in pipelines:
+        try:
+            run_or_raise(pipeline)
+        except Exception as e:
+            # Pipeline.run() has already logged the detail ("Pipeline
+            # run failed", or "Processing error for" each file); this
+            # line names the pipeline it happened in.
+            logger.error(
+                "Run for %s did not finish cleanly: %s",
+                pipeline.warehouse.identity,
+                e,
+            )
+            ok = False
+    return 0 if ok else 1
+
+
+def parse_upload(data: Mapping[str, Any]) -> Upload:
+    """Read the GCS notification inside an Eventarc Pub/Sub event.
+
+    Args:
+        data: The CloudEvent's data: a Pub/Sub push body whose
+            message.data is the GCS notification as base64 JSON
+            (bucket notifications with --payload-format=json).
+
+    Returns:
+        The uploaded object.
+
+    Raises:
+        ValueError: data is not a GCS notification.
+    """
+    try:
+        message = data["message"]
+        notification = json.loads(base64.b64decode(message["data"]))
+        attributes = message.get("attributes") or {}
+        for field in ("bucket", "name"):
+            if not isinstance(notification.get(field), str):
+                raise ValueError(f"notification {field} is not text")
+        return Upload(
+            bucket=notification["bucket"],
+            name=notification["name"],
+            generation=str(notification.get("generation", "")),
+            event_type=attributes.get("eventType", ""),
+        )
+    except (AttributeError, KeyError, TypeError, ValueError) as e:
+        raise ValueError(f"Not a GCS upload notification: {e!r}") from e
+
+
+def handle_upload(
+    data: Mapping[str, Any], pipelines: Mapping[str, Pipeline]
+) -> list[Result]:
+    """Run the pipeline for the landing folder an upload went to.
+
+    For a Cloud Run service behind an Eventarc Pub/Sub trigger; pass
+    the CloudEvent's data. The run lists the whole folder, so files
+    that land together are all loaded by whichever event runs first,
+    and the later events find them already loaded.
+
+    An event that can't be acted on is logged and returns normally,
+    so Pub/Sub doesn't deliver it again: retrying wouldn't change it.
+
+    Args:
+        data: The CloudEvent's data (see parse_upload()).
+        pipelines: Pipeline per landing folder, keyed by the folder
+            its GCSSource reads, e.g. "was/" ("" for the bucket
+            root). Leading and trailing slashes are optional.
+
+    Returns:
+        One Result per file in the folder; empty if the event was
+        ignored (unreadable, not a new object, a folder with no
+        pipeline, or a bucket other than the one that pipeline's
+        GCSSource reads).
+
+    Raises:
+        RunFailed: A file FAILED; the event should be retried.
+        RuntimeError: Another run holds the warehouse lock.
+        ServiceError: Listing the folder or writing audit failed.
+    """
+    try:
+        upload = parse_upload(data)
+    except ValueError as e:
+        logger.error("Ignoring event: %s", e)
+        return []
+
+    where = f"gs://{upload.bucket}/{upload.name}"
+    if upload.event_type not in _NEW_OBJECT_EVENTS:
+        logger.info("Ignoring %s event for %s", upload.event_type, where)
+        return []
+
+    by_folder = {_folder(key): value for key, value in pipelines.items()}
+    pipeline = by_folder.get(upload.folder)
+    if pipeline is None:
+        logger.warning(
+            "Ignoring upload %s: no pipeline reads folder %r",
+            where,
+            upload.folder,
+        )
+        return []
+    # Pipelines are found by folder, so also check the bucket: an
+    # event from another bucket (a second notification on the same
+    # topic, say) with a matching folder name mustn't start a run.
+    bucket = getattr(pipeline.source, "bucket_name", None)
+    if isinstance(bucket, str) and bucket != upload.bucket:
+        logger.warning(
+            "Ignoring upload %s: the pipeline for folder %r reads "
+            "bucket %r",
+            where,
+            upload.folder,
+            bucket,
+        )
+        return []
+
+    logger.info(
+        "Upload %s (generation %s): running %s",
+        where,
+        upload.generation,
+        pipeline.warehouse.identity,
+    )
+    return run_or_raise(pipeline)
+
+
+def check_freshness(client: QueryClient, view: str) -> list[str]:
+    """Log every source that the freshness view says is overdue.
+
+    Each overdue source is logged at ERROR as "Missing monthly file:
+    <source> (last loaded <date>)", for a log-based alert to match.
+    A run of the daily job therefore repeats the alert every day
+    until the file arrives.
+
+    Args:
+        client: BigQuery client.
+        view: Fully qualified view, "project.dataset.view", with
+            columns source (STRING), last_loaded_at (TIMESTAMP, NULL
+            if never loaded) and overdue (BOOL).
+
+    Returns:
+        Names of the overdue sources, sorted.
+
+    Raises:
+        ValueError: view isn't project.dataset.view (letters, digits,
+            underscores and hyphens only).
+        Exception: Whatever the client raises; a check that couldn't
+            run is not reported as "nothing missing".
+    """
+    # The name is interpolated into SQL, so allow only the shape of
+    # a real view name, not just "no backtick".
+    if not _QUALIFIED_NAME.match(view):
+        raise ValueError(
+            f"View name must be project.dataset.view, got {view!r}"
+        )
+    rows = client.query(
+        f"SELECT source, last_loaded_at FROM `{view}` "
+        "WHERE overdue ORDER BY source"
+    ).result()
+    overdue: list[str] = []
+    for row in rows:
+        last = row["last_loaded_at"]
+        logger.error(
+            "Missing monthly file: %s (last loaded %s)",
+            row["source"],
+            last.date().isoformat() if last else "never",
+        )
+        overdue.append(row["source"])
+    return overdue
+
+
+def check_duplicate_loads(client: QueryClient, audit_table: str) -> list[str]:
+    """Log every upload the audit table shows loaded more than once.
+
+    An upload loads at most once per table: the commit transaction
+    checks the audit table first. The one way past that check is two
+    commits of the same upload running at once: a commit still
+    running after the pipeline stopped waiting for it (ten minutes),
+    and a retry's commit starting before it ends. That is unlikely,
+    so it is detected rather than prevented. Each such upload is
+    logged at ERROR as "Duplicate load: <load key> version <version>
+    loaded <n> times into <table>", for a log-based alert. Run it
+    from the daily job.
+
+    No harm is done meanwhile. The documented "latest upload" query
+    for raw tables reads one load per upload (docs/RAW_TABLE_LAYOUT.md);
+    to tidy up, delete the rows of the later load (its ingested_at).
+    On a typed table the second commit merged the same values again.
+
+    Args:
+        client: BigQuery client.
+        audit_table: Fully qualified audit table,
+            "project.dataset.table".
+
+    Returns:
+        "<table> <load key> <version>" for each such upload, sorted.
+
+    Raises:
+        ValueError: audit_table isn't project.dataset.table (letters,
+            digits, underscores and hyphens only).
+        Exception: Whatever the client raises; a check that couldn't
+            run is not reported as "no duplicates".
+    """
+    if not _QUALIFIED_NAME.match(audit_table):
+        raise ValueError(
+            "Audit table name must be project.dataset.table, got "
+            f"{audit_table!r}"
+        )
+    # Grouped by the columns the commit script's "already loaded?"
+    # check compares (_bq_jobs.DEDUP_COLUMNS, plus the table).
+    rows = client.query(
+        "SELECT destination, filename, source_version, COUNT(*) AS loads "
+        f"FROM `{audit_table}` WHERE outcome = 'LOADED' "
+        "GROUP BY destination, filename, source_version "
+        "HAVING COUNT(*) > 1 "
+        "ORDER BY destination, filename, source_version"
+    ).result()
+    found: list[str] = []
+    for row in rows:
+        logger.error(
+            "Duplicate load: %s version %s loaded %d times into %s",
+            row["filename"],
+            row["source_version"],
+            row["loads"],
+            row["destination"],
+        )
+        found.append(
+            f"{row['destination']} {row['filename']} {row['source_version']}"
+        )
+    return found
+
+
+def _folder(prefix: str) -> str:
+    """Normalise a landing folder the way GCSSource does.
+
+    Args:
+        prefix: Folder, with or without leading/trailing slashes.
+
+    Returns:
+        "was/" for "was", "/was" or "was/"; "" for the bucket root.
+    """
+    folder = prefix.strip("/")
+    return f"{folder}/" if folder else ""

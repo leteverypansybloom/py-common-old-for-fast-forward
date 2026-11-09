@@ -1,0 +1,134 @@
+{
+  "valid": {
+    "filename": "events_valid.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees"
+    ],
+    "row_count": 2,
+    "description": "Passes all validations"
+  },
+  "missing_sheet": {
+    "filename": "events_missing_sheet.xlsx",
+    "worksheet": "Wrong",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees"
+    ],
+    "row_count": 2,
+    "description": "Expected worksheet 'Events' not found"
+  },
+  "missing_column": {
+    "filename": "events_missing_column.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id"
+    ],
+    "row_count": 2,
+    "description": "Missing required column 'attendees'"
+  },
+  "extra_column": {
+    "filename": "events_extra_column.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees",
+      "extra"
+    ],
+    "row_count": 2,
+    "description": "Unexpected column 'extra'"
+  },
+  "invalid_type": {
+    "filename": "events_invalid_type.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees"
+    ],
+    "row_count": 1,
+    "description": "Column 'attendees' has string instead of int"
+  },
+  "missing_value": {
+    "filename": "events_missing_value.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees"
+    ],
+    "row_count": 1,
+    "description": "Required column 'attendees' is null"
+  },
+  "duplicate": {
+    "filename": "events_duplicate.xlsx",
+    "worksheet": "Events",
+    "headers": [
+      "event_id",
+      "employer_id",
+      "attendees"
+    ],
+    "row_count": 2,
+    "description": "Duplicate value in unique column 'event_id'"
+  },
+  "hww_header_row_2": {
+    "filename": "hww_header_row_2.xlsx",
+    "worksheet": "Account signups",
+    "header_row": 2,
+    "headers": [
+      "Count",
+      null,
+      "Org",
+      "Size"
+    ],
+    "row_count": 2,
+    "description": "Headings on row 2; sign-up month under a blank heading"
+  },
+  "hww_repeated_other": {
+    "filename": "hww_repeated_other.xlsx",
+    "worksheet": "Survey info",
+    "header_row": 1,
+    "headers": [
+      "Org",
+      "Q4 Option A",
+      "Other",
+      "Q7 Option A",
+      "Other"
+    ],
+    "row_count": 2,
+    "description": "Two tick-box questions each with an 'Other' column"
+  },
+  "hww_personal_data": {
+    "filename": "hww_personal_data.xlsx",
+    "worksheet": "query (1)",
+    "header_row": 1,
+    "headers": [
+      "Participant ID",
+      "Business Name",
+      "First Name",
+      "Email Address",
+      "Sector"
+    ],
+    "row_count": 2,
+    "description": "Names and email addresses a contract should exclude"
+  },
+  "hww_header_mismatch": {
+    "filename": "hww_header_mismatch.xlsx",
+    "worksheet": "query (1)",
+    "header_row": 1,
+    "headers": [
+      "Participant ID",
+      "Business Name",
+      "First Name",
+      "Email Address",
+      "Business Sector"
+    ],
+    "row_count": 2,
+    "description": "'Sector' renamed to 'Business Sector'"
+  }
+}
